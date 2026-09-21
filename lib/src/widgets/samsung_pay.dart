@@ -7,6 +7,7 @@ import 'package:moyasar/src/samsung_pay_sdk/model/amount_box_control.dart';
 import 'package:moyasar/src/samsung_pay_sdk/model/custom_sheet.dart';
 import 'package:moyasar/src/samsung_pay_sdk/model/custom_sheet_payment_info.dart';
 import 'package:moyasar/src/samsung_pay_sdk/samsung_pay_sdk_flutter.dart';
+import 'package:moyasar/src/utils/before_payment_hook.dart';
 import 'package:moyasar/src/utils/moyasar_text_styles.dart';
 
 /// Converts amount from minor units to major (e.g. 20001 -> 200.01 for SAR).
@@ -54,6 +55,7 @@ class SamsungPay extends StatefulWidget {
     super.key,
     required this.config,
     required this.onPaymentResult,
+    this.onBeforePayment,
   }) : assert(
           config.samsungPay != null,
           'Samsung Pay requires samsungPay in PaymentConfig',
@@ -62,6 +64,20 @@ class SamsungPay extends StatefulWidget {
   final PaymentConfig config;
   final Function onPaymentResult;
 
+  /// Runs after the button is pressed and before the Samsung Pay sheet is
+  /// shown, so the app can finish pre-charge work — persisting an idempotency
+  /// record, for instance — while nothing has been charged yet.
+  ///
+  /// The sheet is shown only once it completes `true`. Completing `false` or
+  /// throwing **vetoes** the payment — no sheet, and no [onPaymentResult]
+  /// call, since the app that vetoed already knows why.
+  ///
+  /// Keep it short. It sits between the user's tap and the sheet.
+  ///
+  /// When it is null the button opens the sheet with no await in between,
+  /// exactly as it did before this callback existed.
+  final Future<bool> Function()? onBeforePayment;
+
   @override
   State<SamsungPay> createState() => _SamsungPayState();
 }
@@ -69,6 +85,7 @@ class SamsungPay extends StatefulWidget {
 class _SamsungPayState extends State<SamsungPay> {
   bool _isReady = false;
   bool _isChecking = true;
+  bool _isAwaitingBeforePayment = false;
   late SamsungPaySdkFlutter _samsungPay;
 
   @override
@@ -139,6 +156,22 @@ class _SamsungPayState extends State<SamsungPay> {
   }
 
   void _startPayment() async {
+    final beforePayment = widget.onBeforePayment;
+
+    if (beforePayment != null) {
+      // Awaiting the host opens a window the direct path never had, in which a
+      // second tap would start a second payment.
+      if (_isAwaitingBeforePayment) return;
+      _isAwaitingBeforePayment = true;
+
+      final approved = await runBeforePaymentHook(beforePayment);
+      _isAwaitingBeforePayment = false;
+
+      // A veto, or a widget that went away while the host was working: either
+      // way nothing may be charged, and onPaymentResult has nowhere to go.
+      if (!approved || !mounted) return;
+    }
+
     final samsungConfig = widget.config.samsungPay!;
     final orderNumber = samsungConfig.orderNumber ??
         '${DateTime.now().millisecondsSinceEpoch}-${widget.config.amount}';
