@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:moyasar/moyasar.dart';
 import 'package:moyasar/src/models/apple_pay_availability.dart';
+import 'package:moyasar/src/utils/before_payment_hook.dart';
 import 'dart:convert';
 
 /// The widget that shows the Apple Pay button.
@@ -21,12 +22,28 @@ class ApplePay extends StatefulWidget {
       required this.config,
       required this.onPaymentResult,
       this.buttonType = ApplePayButtonType.inStore,
-      this.buttonStyle = ApplePayButtonStyle.black})
+      this.buttonStyle = ApplePayButtonStyle.black,
+      this.onBeforePayment})
       : assert(config.applePay != null,
             "Please add applePayConfig when instantiating the paymentConfig.");
 
   final PaymentConfig config;
   final Function onPaymentResult;
+
+  /// Runs after the button is pressed and before the Apple Pay sheet is
+  /// presented, so the app can finish pre-charge work — persisting an
+  /// idempotency record, for instance — while nothing has been charged yet.
+  ///
+  /// The native side waits for this future: the sheet is presented only once
+  /// it completes `true`. Completing `false` or throwing **vetoes** the
+  /// payment — no sheet, and no [onPaymentResult] call, since the app that
+  /// vetoed already knows why.
+  ///
+  /// Keep it short. It sits between the user's tap and Apple's sheet.
+  ///
+  /// When it is null the button presents the sheet natively, exactly as it
+  /// did before this callback existed.
+  final Future<bool> Function()? onBeforePayment;
 
   /// The wording Apple shows on the button, e.g. "Buy with Apple Pay" for
   /// [ApplePayButtonType.buy]. Pick the one that matches the action the user
@@ -46,6 +63,8 @@ class ApplePay extends StatefulWidget {
 class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
   static const String _applePayButtonViewNativeId =
       "flutter.moyasar.com/apple_pay/button";
+
+  static const String _beforePaymentMethod = "onBeforePayment";
 
   /// `null` while the native readiness check is still in flight.
   ApplePayAvailability? _availability;
@@ -146,6 +165,10 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
       onApplePayResult(Map<String, dynamic>.from(arguments));
     } else if (call.method == 'onApplePayError') {
       onApplePayError();
+    } else if (call.method == _beforePaymentMethod) {
+      // Returned, not awaited-and-dropped: the native side blocks the sheet on
+      // this reply.
+      return runBeforePaymentHook(widget.onBeforePayment);
     }
 
     return null;
@@ -186,6 +209,11 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
       "paymentAmount": (widget.config.amount / 100).toStringAsFixed(2),
       "buttonType": widget.buttonType.name,
       "buttonStyle": widget.buttonStyle.name,
+      // Only emitted when there is a hook, so a caller that passes none sends
+      // the same params as before and keeps the straight-to-sheet press. The
+      // view's key is derived from this JSON, so adding or removing the hook
+      // rebuilds the native view rather than leaving it on the wrong path.
+      if (widget.onBeforePayment != null) "hasBeforePaymentHook": true,
     });
   }
 

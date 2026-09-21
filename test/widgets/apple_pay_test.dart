@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -13,7 +15,8 @@ void main() {
   List<MethodCall> mockNativeAvailability(String? availability) {
     final calls = <MethodCall>[];
 
-    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (call) async {
+    binding.defaultBinaryMessenger.setMockMethodCallHandler(channel,
+        (call) async {
       calls.add(call);
       return availability;
     });
@@ -33,7 +36,11 @@ void main() {
         ),
       );
 
-  Widget buildSubject({int amount = 123, Function? onPaymentResult}) =>
+  Widget buildSubject({
+    int amount = 123,
+    Function? onPaymentResult,
+    Future<bool> Function()? onBeforePayment,
+  }) =>
       MaterialApp(
         home: Scaffold(
           body: ApplePay(
@@ -49,6 +56,7 @@ void main() {
               ),
             ),
             onPaymentResult: onPaymentResult ?? (_) {},
+            onBeforePayment: onBeforePayment,
           ),
         ),
       );
@@ -62,6 +70,20 @@ void main() {
       channel.codec.encodeMethodCall(MethodCall(method, arguments)),
       (_) {},
     );
+  }
+
+  /// Delivers [method] the way the native side would and returns what Dart
+  /// answered, decoded from the reply envelope.
+  Future<Object?> callFromNative(String method) async {
+    Object? reply;
+
+    await binding.defaultBinaryMessenger.handlePlatformMessage(
+      channel.name,
+      channel.codec.encodeMethodCall(MethodCall(method)),
+      (data) => reply = channel.codec.decodeEnvelope(data!),
+    );
+
+    return reply;
   }
 
   tearDown(() {
@@ -175,5 +197,140 @@ void main() {
     expect(results.single, isA<PaymentCanceledError>());
 
     debugDefaultTargetPlatformOverride = null;
+  });
+
+  group('onBeforePayment', () {
+    /// The exact creationParams 3.0.5 sent for [buildSubject]'s config, copied
+    /// off the pre-hook build. A consumer that passes no hook must still get
+    /// this payload byte for byte, since it is what the native press path
+    /// branches on.
+    const unhookedNativeConfig =
+        '{"merchantIdentifier":"merchant.com.test","paymentLabel":"Test Store","merchantCapabilities":["3DS","debit","credit"],"supportedCountries":["SA"],"supportedNetworks":["visa","mada","masterCard","unionpay"],"countryCode":"SA","currencyCode":"SAR","paymentAmount":"1.23","buttonType":"inStore","buttonStyle":"black"}';
+
+    Future<void> pumpWithHook(
+      WidgetTester tester,
+      Future<bool> Function()? hook,
+    ) async {
+      mockNativeAvailability('ready');
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      await tester.pumpWidget(buildSubject(onBeforePayment: hook));
+      await tester.pumpAndSettle();
+
+      debugDefaultTargetPlatformOverride = null;
+    }
+
+    String creationParams(WidgetTester tester) =>
+        tester.widget<UiKitView>(find.byType(UiKitView)).creationParams
+            as String;
+
+    testWidgets('sends the pre-hook creationParams when no hook is given',
+        (tester) async {
+      await pumpWithHook(tester, null);
+
+      expect(creationParams(tester), unhookedNativeConfig);
+    });
+
+    testWidgets('flags the native side when a hook is given', (tester) async {
+      // Without this flag the native press presents the sheet immediately, so
+      // the hook would never be consulted and a veto would charge anyway.
+      await pumpWithHook(tester, () async => true);
+
+      expect(
+        creationParams(tester),
+        '${unhookedNativeConfig.substring(0, unhookedNativeConfig.length - 1)}'
+        ',"hasBeforePaymentHook":true}',
+      );
+    });
+
+    testWidgets('recreates the native view when a hook is added',
+        (tester) async {
+      // The native view reads creationParams once. A hook added to a live
+      // widget must change the key, or the button keeps presenting without it.
+      mockNativeAvailability('ready');
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+
+      await tester.pumpWidget(buildSubject());
+      await tester.pumpAndSettle();
+      final unhookedKey = tester.widget<UiKitView>(find.byType(UiKitView)).key;
+
+      await tester.pumpWidget(buildSubject(onBeforePayment: () async => true));
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.widget<UiKitView>(find.byType(UiKitView)).key,
+        isNot(unhookedKey),
+      );
+
+      debugDefaultTargetPlatformOverride = null;
+    });
+
+    testWidgets('answers true when the hook approves', (tester) async {
+      await pumpWithHook(tester, () async => true);
+
+      expect(await callFromNative('onBeforePayment'), isTrue);
+    });
+
+    testWidgets('answers false when the hook vetoes', (tester) async {
+      await pumpWithHook(tester, () async => false);
+
+      expect(await callFromNative('onBeforePayment'), isFalse);
+    });
+
+    testWidgets('answers false when the hook throws', (tester) async {
+      await pumpWithHook(tester, () async => throw StateError('disk full'));
+
+      expect(await callFromNative('onBeforePayment'), isFalse);
+    });
+
+    testWidgets('answers true when no hook is given', (tester) async {
+      // Defensive: a native view that asks anyway must not be left hanging,
+      // which would be a button that never presents.
+      await pumpWithHook(tester, null);
+
+      expect(await callFromNative('onBeforePayment'), isTrue);
+    });
+
+    testWidgets('does not answer until the hook completes', (tester) async {
+      // The whole point of the hook: the native side is still waiting, so the
+      // sheet has not presented, while the host's pre-charge work is in flight.
+      final gate = Completer<bool>();
+      await pumpWithHook(tester, () => gate.future);
+
+      Object? reply;
+      var answered = false;
+      final pending = binding.defaultBinaryMessenger.handlePlatformMessage(
+        channel.name,
+        channel.codec.encodeMethodCall(const MethodCall('onBeforePayment')),
+        (data) {
+          answered = true;
+          reply = channel.codec.decodeEnvelope(data!);
+        },
+      );
+
+      await tester.pump();
+      expect(answered, isFalse);
+
+      gate.complete(true);
+      await pending;
+
+      expect(reply, isTrue);
+    });
+
+    testWidgets('does not run the hook for any other native call',
+        (tester) async {
+      var runs = 0;
+      await pumpWithHook(tester, () async {
+        runs++;
+        return true;
+      });
+
+      await sendFromNative('onApplePayError', null);
+      await tester.pumpAndSettle();
+
+      expect(runs, 0);
+    });
   });
 }

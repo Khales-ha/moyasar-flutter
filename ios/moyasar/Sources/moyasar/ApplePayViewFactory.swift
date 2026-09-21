@@ -3,7 +3,7 @@ import UIKit
 import PassKit
 
 protocol ApplePayButtonHandler: AnyObject {
-    func onApplePayButtonPressed(applePayConfig: Any?)
+    func onApplePayButtonPressed(applePayConfig: Any?, hasBeforePaymentHook: Bool)
     func onApplePaySetupButtonPressed()
 }
 
@@ -42,6 +42,7 @@ class ApplePayView: NSObject, FlutterPlatformView {
     private weak var delegate: ApplePayButtonHandler?
     private let applePayConfig: Any?
     private let availability: ApplePayAvailability
+    private let hasBeforePaymentHook: Bool
 
     init(
         frame: CGRect,
@@ -60,6 +61,7 @@ class ApplePayView: NSObject, FlutterPlatformView {
         self.availability = config
             .map { ApplePayAvailability.current(supportedNetworks: $0.supportedNetworks) }
             ?? .notSupported
+        self.hasBeforePaymentHook = config?.hasBeforePaymentHook ?? false
 
         super.init()
         createAndLoadApplePayButton(config: config)
@@ -68,7 +70,7 @@ class ApplePayView: NSObject, FlutterPlatformView {
     @objc func handleApplePayButtonPressed() {
         switch availability {
         case .ready:
-            delegate?.onApplePayButtonPressed(applePayConfig: applePayConfig)
+            delegate?.onApplePayButtonPressed(applePayConfig: applePayConfig, hasBeforePaymentHook: hasBeforePaymentHook)
         case .needsSetup:
             delegate?.onApplePaySetupButtonPressed()
         case .notSupported:
