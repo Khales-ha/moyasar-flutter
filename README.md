@@ -127,6 +127,7 @@ ApplePay(
   onPaymentResult: onPaymentResult,
   buttonType: ApplePayButtonType.buy,          // optional, default: inStore
   buttonStyle: ApplePayButtonStyle.automatic,  // optional, default: black
+  onBeforePayment: armForCharge,               // optional, see below
 )
 ```
 
@@ -149,7 +150,11 @@ Renders Apple's native `PKPaymentButton` and drives the sheet through PassKit �
 Samsung Android devices only. Add the `spay_sdk_api_level` meta-data to your `AndroidManifest.xml` — see the [integration guide](https://docs.moyasar.com/guides/samsung-pay/basic-integration/). The SDK bundles Samsung's official Flutter plugin, so no app-level override is needed.
 
 ```dart
-SamsungPay(config: paymentConfig, onPaymentResult: onPaymentResult)
+SamsungPay(
+  config: paymentConfig,
+  onPaymentResult: onPaymentResult,
+  onBeforePayment: armForCharge, // optional, see "Pre-charge hook"
+)
 ```
 
 The widget hides itself when Samsung Pay isn't ready. To check explicitly in a custom flow:
@@ -160,6 +165,31 @@ final eligible = await SamsungPayEligibility.isEligible(paymentConfig);
 final result = await SamsungPayEligibility.check(paymentConfig); // with diagnostics
 debugPrint('${result.reason}'); // ready, notAndroid, notReady, sdkError, timeout...
 ```
+
+### Pre-charge hook
+
+Both wallet buttons accept an optional `onBeforePayment`, awaited between the
+user's press and the payment sheet. Use it for work that must land before
+anything can be charged — writing an idempotency record, for example.
+
+```dart
+Future<bool> armForCharge() async {
+  try {
+    await markerStore.write(marker);
+    return true;
+  } catch (_) {
+    return false; // vetoed: no sheet, nothing charged
+  }
+}
+```
+
+The sheet opens **only** when the future completes `true`. Completing `false`
+or throwing vetoes the payment: the sheet never opens and `onPaymentResult` is
+not called, since the app that vetoed already knows why. Keep the hook short —
+it sits between the tap and the sheet. It does not run for Apple's "Set Up
+Apple Pay" button, which charges nothing.
+
+Omit it and both buttons behave exactly as they did before it existed.
 
 ## Credit Card & STC Pay
 

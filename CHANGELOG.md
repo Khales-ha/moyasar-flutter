@@ -1,3 +1,6 @@
+## Unreleased
+- [Apple Pay][Samsung Pay] Add an optional `onBeforePayment` callback to both wallet buttons, awaited between the press and the payment sheet. The sheet is presented only when it completes `true`; completing `false` or throwing vetoes the payment. On iOS the native button waits for the Dart reply before presenting. Omitting the callback leaves both widgets on their previous path unchanged.
+
 ## 3.0.5
 - [Apple Pay] Replace the `pay` package dependency with a native PassKit implementation on iOS, removing the transitive `pay`/`pay_android`/`pay_ios`/`pay_platform_interface` dependencies. The `ApplePay` widget's public API is unchanged; `ApplePayButtonType` and `ApplePayButtonStyle` are now exported directly from `package:moyasar` instead of `package:pay`.
 - [Apple Pay] The `ApplePay` widget now hides itself automatically on non-iOS platforms and on iOS devices that can't use Apple Pay, instead of relying on the app to guard it with a platform check.
