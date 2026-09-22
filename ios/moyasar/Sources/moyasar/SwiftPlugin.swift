@@ -42,9 +42,9 @@ public class SwiftPlugin: NSObject, FlutterPlugin {
 }
 
 extension SwiftPlugin: ApplePayButtonHandler {
-    func onApplePayButtonPressed(applePayConfig: Any?, hasBeforePaymentHook: Bool) {
-        guard hasBeforePaymentHook else {
-            applePayHandler.presentApplePay(applePayConfig: applePayConfig)
+    func onApplePayButtonPressed(applePayConfig: Any?, viewChannel: FlutterMethodChannel?) {
+        guard let viewChannel = viewChannel else {
+            applePayHandler.presentApplePay(applePayConfig: applePayConfig, replyChannel: channel)
             return
         }
 
@@ -55,7 +55,9 @@ extension SwiftPlugin: ApplePayButtonHandler {
         guard !isAwaitingBeforePayment else { return }
         isAwaitingBeforePayment = true
 
-        channel.invokeMethod(beforePaymentMethod, arguments: nil) { [weak self] approval in
+        // The config is echoed back so Dart can check the press came from the
+        // view it is currently rendering, and not one left behind by a rebuild.
+        viewChannel.invokeMethod(beforePaymentMethod, arguments: applePayConfig) { [weak self] approval in
             guard let self = self else { return }
             self.isAwaitingBeforePayment = false
 
@@ -64,7 +66,7 @@ extension SwiftPlugin: ApplePayButtonHandler {
             // pre-charge work did not complete, so the charge is not allowed.
             guard (approval as? Bool) == true else { return }
 
-            self.applePayHandler.presentApplePay(applePayConfig: applePayConfig)
+            self.applePayHandler.presentApplePay(applePayConfig: applePayConfig, replyChannel: viewChannel)
         }
     }
 

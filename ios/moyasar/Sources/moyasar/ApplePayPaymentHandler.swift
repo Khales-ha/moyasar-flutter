@@ -11,14 +11,20 @@ private enum ApplePaySessionStatus {
 class ApplePayPaymentHandler: NSObject {
 
     private var controller: PKPaymentAuthorizationController?
-    private let channel: FlutterMethodChannel
+
+    /// Where this session's callbacks go. Set per presentation so a result is
+    /// delivered to the widget whose button was pressed, rather than to
+    /// whichever one holds the shared channel's handler.
+    private var channel: FlutterMethodChannel
     private var sessionStatus: ApplePaySessionStatus = .started
 
     init(channel: FlutterMethodChannel) {
         self.channel = channel
     }
 
-    func presentApplePay(applePayConfig: Any?) {
+    func presentApplePay(applePayConfig: Any?, replyChannel: FlutterMethodChannel) {
+        channel = replyChannel
+
         guard let applePayConfigData = (applePayConfig as? String)?.data(using: .utf8), let config = try? JSONDecoder().decode(ApplePayConfig.self, from: applePayConfigData) else {
             channel.invokeMethod("onApplePayError", arguments: nil)
             return
