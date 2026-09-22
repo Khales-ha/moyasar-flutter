@@ -66,9 +66,11 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
 
   static const String _beforePaymentMethod = "onBeforePayment";
 
-  /// Names each widget's own channel apart. Only ever increases, so a name is
-  /// never handed out twice and a press left in flight by a disposed widget
-  /// cannot reach a later one.
+  /// Names each widget's own channel apart. Only ever increases, so within one
+  /// isolate run a name is never handed out twice and a press left in flight by
+  /// a disposed widget cannot reach a later one. A hot restart resets it, which
+  /// is a development-only concern: a release build never restarts an isolate
+  /// under a live native view.
   static int _nextViewChannelId = 0;
 
   /// The channel this widget alone answers on, whose name the native view is
@@ -79,13 +81,19 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
   late final MethodChannel _viewChannel = MethodChannel(
       'flutter.moyasar.com/apple_pay/view/${_nextViewChannelId++}');
 
-  /// Whether this widget installed the handler currently on the shared
-  /// channel. It may only clear a handler it installed itself.
-  bool _listensOnSharedChannel = false;
+  /// The state whose handler sits on the shared channel right now, or null when
+  /// nobody's does. The channel holds one handler, so registering overwrites
+  /// whoever held it; recording the holder is what stops a widget leaving the
+  /// shared path from clearing a sibling's handler and leaving that button
+  /// answered by nobody. Written only beside the two calls that install and
+  /// clear that handler.
+  static _ApplePayState? _sharedChannelOwner;
 
-  /// The config that was on screen when this widget approved the press the
-  /// native side is presenting, so the charge is for the transaction the host
-  /// approved rather than whatever a later rebuild left behind.
+  /// The config this widget approved for the press the native side is
+  /// presenting on [_viewChannel]. Taken and dropped by the next call on that
+  /// channel, so it cannot outlive the press it was made for, and read only for
+  /// a press that came through Dart — a hookless press never asks, so it is
+  /// charged the config its button was built from.
   PaymentConfig? _approvedConfig;
 
   /// `null` while the native readiness check is still in flight.
@@ -134,10 +142,7 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
     if (_isRunningOnIos) {
       WidgetsBinding.instance.removeObserver(this);
       _viewChannel.setMethodCallHandler(null);
-
-      if (_listensOnSharedChannel) {
-        widget.channel.setMethodCallHandler(null);
-      }
+      _releaseSharedChannel();
     }
 
     super.dispose();
@@ -148,19 +153,26 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
   /// which is the path a hookless widget has always taken.
   void _syncMethodCallHandler() {
     if (widget.onBeforePayment != null) {
-      _viewChannel.setMethodCallHandler(_handleNativeCall);
-
-      if (_listensOnSharedChannel) {
-        widget.channel.setMethodCallHandler(null);
-        _listensOnSharedChannel = false;
-      }
-
+      _viewChannel
+          .setMethodCallHandler((call) => _handleNativeCall(call, true));
+      _releaseSharedChannel();
       return;
     }
 
     _viewChannel.setMethodCallHandler(null);
-    widget.channel.setMethodCallHandler(_handleNativeCall);
-    _listensOnSharedChannel = true;
+    widget.channel
+        .setMethodCallHandler((call) => _handleNativeCall(call, false));
+    _sharedChannelOwner = this;
+  }
+
+  /// Clears the shared channel's single handler, but only this widget's own.
+  void _releaseSharedChannel() {
+    if (!identical(_sharedChannelOwner, this)) {
+      return;
+    }
+
+    widget.channel.setMethodCallHandler(null);
+    _sharedChannelOwner = null;
   }
 
   /// Re-checks readiness whenever the app is foregrounded, so the button
@@ -200,7 +212,16 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
     });
   }
 
-  Future<dynamic> _handleNativeCall(MethodCall call) async {
+  /// Handles a call from the native side. [onViewChannel] says which channel it
+  /// arrived on: this widget's own, which only a press it was asked about uses,
+  /// or the shared one, which carries hookless presses that never reach Dart.
+  Future<dynamic> _handleNativeCall(MethodCall call, bool onViewChannel) async {
+    // An approval describes one presentation, and a native call means that
+    // presentation is over: its result, its dismissal, or a fresh press. Taking
+    // it here is what keeps a later charge from reading a dead snapshot.
+    final approvedConfig = onViewChannel ? _approvedConfig : null;
+    _approvedConfig = null;
+
     if (call.method == 'onApplePayResult') {
       final arguments = call.arguments;
 
@@ -212,13 +233,14 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
         return null;
       }
 
-      onApplePayResult(Map<String, dynamic>.from(arguments));
+      onApplePayResult(Map<String, dynamic>.from(arguments),
+          approvedConfig ?? widget.config);
     } else if (call.method == 'onApplePayError') {
       onApplePayError();
     } else if (call.method == _beforePaymentMethod) {
       // Returned, not awaited-and-dropped: the native side blocks the sheet on
       // this reply.
-      return _approveBeforePayment(call.arguments);
+      return _approveBeforePayment(call.arguments, onViewChannel);
     }
 
     return null;
@@ -226,7 +248,8 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
 
   /// Answers whether the sheet may be presented for the press that carried
   /// [pressedNativeConfig] — the `creationParams` of the view that was pressed.
-  Future<bool> _approveBeforePayment(Object? pressedNativeConfig) async {
+  Future<bool> _approveBeforePayment(
+      Object? pressedNativeConfig, bool onViewChannel) async {
     // The native view presents the sheet from the params it was created with,
     // so a press carrying anything else came from a button showing a
     // transaction this widget no longer renders.
@@ -244,7 +267,7 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
       return false;
     }
 
-    _approvedConfig = pressedConfig;
+    _approvedConfig = onViewChannel ? pressedConfig : null;
     return true;
   }
 
@@ -252,12 +275,13 @@ class _ApplePayState extends State<ApplePay> with WidgetsBindingObserver {
     widget.onPaymentResult(PaymentCanceledError());
   }
 
-  void onApplePayResult(Map<String, dynamic> paymentResult) async {
-    // Read before the charge, which awaits: a rebuild during the sheet or the
-    // request would otherwise move the charge onto a different transaction and
-    // report it to a different listener.
+  /// Charges [config] — the transaction the press was approved for — and
+  /// reports the outcome.
+  void onApplePayResult(
+      Map<String, dynamic> paymentResult, PaymentConfig config) async {
+    // Read before the charge, which awaits: a rebuild during the request would
+    // otherwise report the result to a different listener.
     final onPaymentResult = widget.onPaymentResult;
-    final config = _approvedConfig ?? widget.config;
     final token = paymentResult['token'];
 
     if (((token ?? '') == '')) {

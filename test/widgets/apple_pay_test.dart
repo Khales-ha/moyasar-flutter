@@ -65,6 +65,22 @@ void main() {
     );
   }
 
+  /// Delivers [method] on [channelName] and answers whether a handler took it.
+  /// A channel nobody listens on replies with no envelope at all, which is what
+  /// a dead button looks like from the native side.
+  Future<bool> sendTo(String channelName, String method,
+      [Object? arguments]) async {
+    ByteData? envelope;
+
+    await binding.defaultBinaryMessenger.handlePlatformMessage(
+      channelName,
+      channel.codec.encodeMethodCall(MethodCall(method, arguments)),
+      (data) => envelope = data,
+    );
+
+    return envelope != null;
+  }
+
   tearDown(() {
     binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, null);
   });
@@ -561,6 +577,178 @@ void main() {
       expect(bodies, hasLength(1));
       expect(jsonDecode(bodies.single)['amount'], 10000);
       expect(results.single, isA<NetworkError>());
+    });
+
+    testWidgets('charges the amount on the button once the hook is gone',
+        (tester) async {
+      // The snapshot belongs to the press it was taken for. A widget that loses
+      // its hook presents natively with no Dart round trip, so the customer
+      // sees the live amount — and must be charged that, not the one an earlier
+      // press approved.
+      final bodies = <String>[];
+      final client = MockClient((request) async {
+        bodies.add(request.body);
+        return http.Response(jsonEncode({'type': 'network_error'}), 400);
+      });
+
+      mockNativeAvailability('ready');
+
+      await http.runWithClient(() async {
+        await asIos(() async {
+          await tester.pumpWidget(
+              buildSubject(amount: 10000, onBeforePayment: () async => true));
+          await tester.pumpAndSettle();
+
+          expect(await pressFromNative(tester), isTrue);
+
+          await tester.pumpWidget(buildSubject(amount: 55555));
+          await tester.pumpAndSettle();
+
+          // The button really is on the hookless path: it shows 555.55 and was
+          // given no channel of its own, so its press never reaches Dart.
+          expect(creationParams(tester), contains('"paymentAmount":"555.55"'));
+          expect(viewChannel(creationParams(tester)), channel.name);
+
+          await sendFromNative('onApplePayResult', {'token': 'tok_test'});
+          await tester.pumpAndSettle();
+        });
+      }, () => client);
+
+      expect(bodies, hasLength(1));
+      expect(jsonDecode(bodies.single)['amount'], 55555);
+    });
+
+    testWidgets('leaves a hookless sibling answered when another gains a hook',
+        (tester) async {
+      // The shared channel holds one handler and the last to register owns it.
+      // Clearing it on the way to a private channel, without checking who
+      // installed it, left the sibling's button silently dead: the sheet still
+      // presents, the customer authorizes, and nothing charges.
+      mockNativeAvailability('ready');
+      final sibling = <dynamic>[];
+
+      // Cached on purpose, so the rebuild below hands Flutter the identical
+      // widget and it skips this one's didUpdateWidget. Rebuilding both in the
+      // same frame hides the bug: the sibling re-registers straight away.
+      final cachedSibling = ApplePay(
+        config: buildConfig(amount: 2000),
+        onPaymentResult: sibling.add,
+      );
+
+      Widget tree({required bool firstHasHook}) => MaterialApp(
+            home: Scaffold(
+              body: Column(children: [
+                ApplePay(
+                  config: buildConfig(amount: 1000),
+                  onPaymentResult: (_) {},
+                  onBeforePayment: firstHasHook ? (() async => true) : null,
+                ),
+                cachedSibling,
+              ]),
+            ),
+          );
+
+      await asIos(() async {
+        await tester.pumpWidget(tree(firstHasHook: false));
+        await tester.pumpAndSettle();
+
+        await sendFromNative('onApplePayError', null);
+        await tester.pumpAndSettle();
+        expect(sibling, hasLength(1),
+            reason: 'the sibling registered last, so it owns the handler');
+
+        await tester.pumpWidget(tree(firstHasHook: true));
+        await tester.pumpAndSettle();
+
+        await sendFromNative('onApplePayError', null);
+        await tester.pumpAndSettle();
+      });
+
+      expect(sibling, hasLength(2));
+    });
+
+    testWidgets('stops answering the shared channel once it has a hook',
+        (tester) async {
+      // A hooked widget left squatting on the shared channel would answer
+      // hookless presses meant for another button.
+      mockNativeAvailability('ready');
+      final results = <dynamic>[];
+
+      await asIos(() async {
+        await tester.pumpWidget(buildSubject(onPaymentResult: results.add));
+        await tester.pumpAndSettle();
+
+        expect(await sendTo(channel.name, 'onApplePayError'), isTrue);
+        expect(results, hasLength(1));
+
+        await tester.pumpWidget(buildSubject(
+          onPaymentResult: results.add,
+          onBeforePayment: () async => true,
+        ));
+        await tester.pumpAndSettle();
+
+        expect(await sendTo(channel.name, 'onApplePayError'), isFalse);
+      });
+
+      expect(results, hasLength(1));
+    });
+
+    testWidgets('stops answering its own channel once it is gone',
+        (tester) async {
+      // Disposal clears the per-view handler, so a press the native side left
+      // in flight reaches nobody rather than running a departed widget's hook.
+      var runs = 0;
+      await pumpWithHook(tester, () async {
+        runs++;
+        return true;
+      });
+
+      final params = creationParams(tester);
+      final ownChannel = viewChannel(params);
+
+      await asIos(() async {
+        await tester.pumpWidget(const MaterialApp(home: Scaffold()));
+        await tester.pumpAndSettle();
+      });
+
+      expect(await sendTo(ownChannel, 'onBeforePayment', params), isFalse);
+      expect(runs, 0);
+    });
+
+    testWidgets('reports to the listener that was there when the charge began',
+        (tester) async {
+      // Moyasar.pay awaits. A rebuild while the request is in flight must not
+      // hand the outcome to a listener that never saw this payment start.
+      final inFlight = Completer<void>();
+      final release = Completer<void>();
+      final client = MockClient((request) async {
+        inFlight.complete();
+        await release.future;
+        return http.Response(jsonEncode({'type': 'network_error'}), 400);
+      });
+
+      mockNativeAvailability('ready');
+      final atResult = <dynamic>[];
+      final later = <dynamic>[];
+
+      await http.runWithClient(() async {
+        await asIos(() async {
+          await tester.pumpWidget(buildSubject(onPaymentResult: atResult.add));
+          await tester.pumpAndSettle();
+
+          await sendFromNative('onApplePayResult', {'token': 'tok_test'});
+          await inFlight.future;
+
+          await tester.pumpWidget(buildSubject(onPaymentResult: later.add));
+          await tester.pumpAndSettle();
+
+          release.complete();
+          await tester.pumpAndSettle();
+        });
+      }, () => client);
+
+      expect(atResult.single, isA<NetworkError>());
+      expect(later, isEmpty);
     });
   });
 }
