@@ -1,6 +1,6 @@
 import 'dart:convert';
-import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:moyasar/moyasar.dart';
 import 'package:moyasar/src/samsung_pay_sdk/model/amount_box_control.dart';
@@ -94,8 +94,11 @@ class _SamsungPayState extends State<SamsungPay> {
     _initSamsungPay();
   }
 
+  bool get _isRunningOnAndroid =>
+      defaultTargetPlatform == TargetPlatform.android;
+
   void _initSamsungPay() {
-    if (!Platform.isAndroid || widget.config.samsungPay == null) {
+    if (!_isRunningOnAndroid || widget.config.samsungPay == null) {
       setState(() {
         _isReady = false;
         _isChecking = false;
@@ -115,13 +118,19 @@ class _SamsungPayState extends State<SamsungPay> {
 
     _samsungPay.getSamsungPayStatus(
       StatusListener(
+        // The readiness answer comes back from the native side long after the
+        // tap that mounted this widget, so it can arrive once it is gone.
         onSuccess: (status, bundle) {
+          if (!mounted) return;
+
           setState(() {
             _isReady = status.toString() == '2'; // SPAY_READY
             _isChecking = false;
           });
         },
         onFail: (errorCode, bundle) {
+          if (!mounted) return;
+
           setState(() {
             _isReady = false;
             _isChecking = false;
@@ -131,9 +140,9 @@ class _SamsungPayState extends State<SamsungPay> {
     );
   }
 
-  List<Brand> _getBrandList() {
+  List<Brand> _getBrandList(PaymentConfig config) {
     final brands = <Brand>[];
-    for (final net in widget.config.supportedNetworks) {
+    for (final net in config.supportedNetworks) {
       switch (net.toJson()) {
         case 'visa':
           brands.add(Brand.VISA);
@@ -156,7 +165,16 @@ class _SamsungPayState extends State<SamsungPay> {
   }
 
   void _startPayment() async {
+    // Every input the payment is made of is read here, at the tap. Awaiting the
+    // hook lets the widget be rebuilt onto a different transaction, and both
+    // the sheet and the charge must be for the one the customer pressed.
+    final config = widget.config;
+    final samsungConfig = config.samsungPay!;
+    final onPaymentResult = widget.onPaymentResult;
     final beforePayment = widget.onBeforePayment;
+    final orderNumber = samsungConfig.orderNumber ??
+        '${DateTime.now().millisecondsSinceEpoch}-${config.amount}';
+    final brands = _getBrandList(config);
 
     if (beforePayment != null) {
       // Awaiting the host opens a window the direct path never had, in which a
@@ -172,16 +190,10 @@ class _SamsungPayState extends State<SamsungPay> {
       if (!approved || !mounted) return;
     }
 
-    final samsungConfig = widget.config.samsungPay!;
-    final orderNumber = samsungConfig.orderNumber ??
-        '${DateTime.now().millisecondsSinceEpoch}-${widget.config.amount}';
-
-    final amountMajor =
-        _toMajorAmount(widget.config.amount, widget.config.currency);
+    final amountMajor = _toMajorAmount(config.amount, config.currency);
 
     final customSheet = CustomSheet();
-    final amountControl =
-        AmountBoxControl('moyasar_amount', widget.config.currency);
+    final amountControl = AmountBoxControl('moyasar_amount', config.currency);
     amountControl.setAmountTotal(amountMajor, SpaySdk.FORMAT_TOTAL_PRICE_ONLY);
     customSheet.addControl(amountControl);
 
@@ -190,10 +202,10 @@ class _SamsungPayState extends State<SamsungPay> {
       customSheet: customSheet,
       orderNumber: orderNumber,
     );
-    paymentInfo.merchantId = widget.config.publishableApiKey
-        .substring(0, 15.clamp(0, widget.config.publishableApiKey.length));
-    paymentInfo.setMerchantCountryCode(widget.config.merchantCountryCode);
-    paymentInfo.setAllowedCardBrands(_getBrandList());
+    paymentInfo.merchantId = config.publishableApiKey
+        .substring(0, 15.clamp(0, config.publishableApiKey.length));
+    paymentInfo.setMerchantCountryCode(config.merchantCountryCode);
+    paymentInfo.setAllowedCardBrands(brands);
     paymentInfo.setAddressInPaymentSheet(AddressInPaymentSheet.DO_NOT_SHOW);
 
     _samsungPay.startInAppPayWithCustomSheet(
@@ -205,7 +217,7 @@ class _SamsungPayState extends State<SamsungPay> {
         onSuccess: (info, paymentCredential, extraData) async {
           final token = _extractToken(paymentCredential);
           if (token.isEmpty) {
-            widget.onPaymentResult(UnprocessableTokenError());
+            onPaymentResult(UnprocessableTokenError());
             return;
           }
 
@@ -215,26 +227,26 @@ class _SamsungPayState extends State<SamsungPay> {
           );
 
           final paymentRequest = PaymentRequest(
-            widget.config,
+            config,
             source,
             additionalMetadata: {'samsungpay_order_id': orderNumber},
           );
 
           try {
             final result = await Moyasar.pay(
-              apiKey: widget.config.publishableApiKey,
+              apiKey: config.publishableApiKey,
               paymentRequest: paymentRequest,
             );
-            widget.onPaymentResult(result);
+            onPaymentResult(result);
           } catch (e) {
-            widget.onPaymentResult(NetworkError());
+            onPaymentResult(NetworkError());
           }
         },
         onFail: (errorCode, bundle) {
           if (errorCode == '${SpaySdk.ERROR_USER_CANCELED}') {
-            widget.onPaymentResult(PaymentCanceledError());
+            onPaymentResult(PaymentCanceledError());
           } else {
-            widget.onPaymentResult(UnprocessableTokenError());
+            onPaymentResult(UnprocessableTokenError());
           }
         },
       ),
@@ -243,7 +255,7 @@ class _SamsungPayState extends State<SamsungPay> {
 
   @override
   Widget build(BuildContext context) {
-    if (!Platform.isAndroid) {
+    if (!_isRunningOnAndroid) {
       return const SizedBox.shrink();
     }
 
