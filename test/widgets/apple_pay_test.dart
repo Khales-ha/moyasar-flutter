@@ -259,6 +259,18 @@ void main() {
       return reply;
     }
 
+    /// Records the bodies of every charge [body] sets off.
+    Future<List<String>> chargesDuring(Future<void> Function() body) async {
+      final bodies = <String>[];
+      final client = MockClient((request) async {
+        bodies.add(request.body);
+        return http.Response(jsonEncode({'type': 'network_error'}), 400);
+      });
+
+      await http.runWithClient(body, () => client);
+      return bodies;
+    }
+
     /// Presses a rendered button the way its native view does: on the channel
     /// it was created with, echoing the params it holds.
     Future<Object?> pressFromNative(WidgetTester tester, [Finder? view]) {
@@ -749,6 +761,66 @@ void main() {
 
       expect(atResult.single, isA<NetworkError>());
       expect(later, isEmpty);
+    });
+
+    testWidgets('charges the button for a result it was never asked about',
+        (tester) async {
+      // An approval covers one presentation. A second result with no approval
+      // behind it has no transaction to honour, so it charges what the button
+      // is showing rather than one already settled.
+      mockNativeAvailability('ready');
+
+      final bodies = await chargesDuring(() async {
+        await asIos(() async {
+          await tester.pumpWidget(
+              buildSubject(amount: 10000, onBeforePayment: () async => true));
+          await tester.pumpAndSettle();
+
+          final ownChannel = viewChannel(creationParams(tester));
+          expect(await pressFromNative(tester), isTrue);
+          await sendTo(ownChannel, 'onApplePayResult', {'token': 'tok_test'});
+          await tester.pumpAndSettle();
+
+          await tester.pumpWidget(
+              buildSubject(amount: 55555, onBeforePayment: () async => true));
+          await tester.pumpAndSettle();
+
+          // The same widget, so the same private channel — but nothing was
+          // approved this time.
+          expect(viewChannel(creationParams(tester)), ownChannel);
+          await sendTo(ownChannel, 'onApplePayResult', {'token': 'tok_test'});
+          await tester.pumpAndSettle();
+        });
+      });
+
+      expect(bodies.map((b) => jsonDecode(b)['amount']), [10000, 55555]);
+    });
+
+    testWidgets('leaves no approval behind when the press came in hookless',
+        (tester) async {
+      // A hookless view presents its own sheet, so the defensive answer it gets
+      // if it asks anyway must not leave a config behind for a later hooked
+      // result to charge.
+      mockNativeAvailability('ready');
+
+      final bodies = await chargesDuring(() async {
+        await asIos(() async {
+          await tester.pumpWidget(buildSubject(amount: 10000));
+          await tester.pumpAndSettle();
+
+          expect(await pressFromNative(tester), isTrue);
+
+          await tester.pumpWidget(
+              buildSubject(amount: 55555, onBeforePayment: () async => true));
+          await tester.pumpAndSettle();
+
+          await sendTo(viewChannel(creationParams(tester)), 'onApplePayResult',
+              {'token': 'tok_test'});
+          await tester.pumpAndSettle();
+        });
+      });
+
+      expect(bodies.map((b) => jsonDecode(b)['amount']), [55555]);
     });
   });
 }
