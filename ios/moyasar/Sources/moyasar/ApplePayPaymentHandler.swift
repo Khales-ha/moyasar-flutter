@@ -11,18 +11,32 @@ private enum ApplePaySessionStatus {
 class ApplePayPaymentHandler: NSObject {
 
     private var controller: PKPaymentAuthorizationController?
-    private let channel: FlutterMethodChannel
+
+    /// Where this session's callbacks go. Set per presentation so a result is
+    /// delivered to the widget whose button was pressed, rather than to
+    /// whichever one holds the shared channel's handler. `isPresenting` is what
+    /// stops it moving under a sheet that is already up.
+    private var channel: FlutterMethodChannel
     private var sessionStatus: ApplePaySessionStatus = .started
+
+    /// Whether a sheet is on its way up or already up. The delegate callbacks
+    /// below are routed by `channel`, which a second presentation overwrites,
+    /// so only one session may be live at a time.
+    private var isPresenting = false
 
     init(channel: FlutterMethodChannel) {
         self.channel = channel
     }
 
-    func presentApplePay(applePayConfig: Any?) {
+    func presentApplePay(applePayConfig: Any?, replyChannel: FlutterMethodChannel) {
+        guard !isPresenting else { return }
+
         guard let applePayConfigData = (applePayConfig as? String)?.data(using: .utf8), let config = try? JSONDecoder().decode(ApplePayConfig.self, from: applePayConfigData) else {
-            channel.invokeMethod("onApplePayError", arguments: nil)
+            replyChannel.invokeMethod("onApplePayError", arguments: nil)
             return
         }
+
+        channel = replyChannel
 
         let request = PKPaymentRequest()
 
@@ -42,6 +56,7 @@ class ApplePayPaymentHandler: NSObject {
         request.merchantCapabilities = PKMerchantCapability(config.merchantCapabilities.compactMap({ PKMerchantCapability.fromString($0) }))
 
         sessionStatus = .started
+        isPresenting = true
         controller = PKPaymentAuthorizationController(paymentRequest: request)
         controller?.delegate = self
         controller?.present(completion: { [weak self] presented in
@@ -49,6 +64,7 @@ class ApplePayPaymentHandler: NSObject {
                 self?.sessionStatus = .presented
             } else {
                 self?.channel.invokeMethod("onApplePayError", arguments: nil)
+                self?.isPresenting = false
             }
         })
     }
@@ -85,6 +101,10 @@ extension ApplePayPaymentHandler: PKPaymentAuthorizationControllerDelegate {
             if sessionStatus != .authorized {
                 self.channel.invokeMethod("onApplePayError", arguments: nil)
             }
+
+            // Released last: a press racing the dismissal must not be able to
+            // repoint `channel` before this session has reported.
+            self.isPresenting = false
         }
     }
 }
