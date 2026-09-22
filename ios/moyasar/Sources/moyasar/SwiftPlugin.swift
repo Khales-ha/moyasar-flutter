@@ -43,16 +43,19 @@ public class SwiftPlugin: NSObject, FlutterPlugin {
 
 extension SwiftPlugin: ApplePayButtonHandler {
     func onApplePayButtonPressed(applePayConfig: Any?, viewChannel: FlutterMethodChannel?) {
+        // Every press is serialized, hooked or not. Awaiting Dart opens a window
+        // the synchronous path never had, and a hookless press landing in it
+        // would present a sheet whose result the handler routes to whichever
+        // widget the hook then approves for. `channel` is built with no task
+        // queue, so its reply arrives on the platform thread — the same one the
+        // button target runs on — and a plain flag is enough to serialize them.
+        guard !isAwaitingBeforePayment else { return }
+
         guard let viewChannel = viewChannel else {
             applePayHandler.presentApplePay(applePayConfig: applePayConfig, replyChannel: channel)
             return
         }
 
-        // Awaiting Dart opens a window the synchronous path never had, in which
-        // a second press would stack a second sheet. `channel` is built with no
-        // task queue, so its reply arrives on the platform thread — the same one
-        // the button target runs on — and a plain flag is enough to serialize them.
-        guard !isAwaitingBeforePayment else { return }
         isAwaitingBeforePayment = true
 
         // The config is echoed back so Dart can check the press came from the
