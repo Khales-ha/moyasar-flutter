@@ -5,7 +5,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
 import 'package:moyasar/moyasar.dart';
+import 'package:moyasar/src/samsung_pay_sdk/spay_core.dart';
 
 void main() {
   const channel = MethodChannel('samsung_pay_sdk_flutter');
@@ -97,6 +100,21 @@ void main() {
     channel.codec.decodeEnvelope(reply! as ByteData);
   }
 
+  /// Fails the open sheet the way the native plugin reports it.
+  Future<void> reportSheetFailed(String errorCode) =>
+      binding.defaultBinaryMessenger.handlePlatformMessage(
+        channel.name,
+        channel.codec.encodeMethodCall(MethodCall(
+          'startInAppPayWithCustomSheetFlutter',
+          jsonEncode({
+            'event': 'onFailure',
+            'errorCode': errorCode,
+            'errorData': <String, dynamic>{},
+          }),
+        )),
+        (_) {},
+      );
+
   Future<void> pumpReady(WidgetTester tester, Widget subject) async {
     await tester.pumpWidget(subject);
     await tester.pump();
@@ -116,6 +134,23 @@ void main() {
       ((payload['customSheet']['sheetControls'] as List).single['items']
               as List)
           .single['dValue'] as double;
+
+  /// Completes the open sheet the way the native plugin does, echoing back the
+  /// payment info the widget sent it.
+  Future<void> reportSheetSucceeded(String credential) =>
+      binding.defaultBinaryMessenger.handlePlatformMessage(
+        channel.name,
+        channel.codec.encodeMethodCall(MethodCall(
+          'startInAppPayWithCustomSheetFlutter',
+          jsonEncode({
+            'event': 'onSuccess',
+            'response': sheetPayload(),
+            'paymentCredential': credential,
+            'extraPaymentData': <String, dynamic>{},
+          }),
+        )),
+        (_) {},
+      );
 
   testWidgets('renders nothing off Android', (tester) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
@@ -274,5 +309,81 @@ void main() {
 
     expect(runs, 1);
     expect(sheetCalls(), hasLength(1));
+  });
+
+  testWidgets('reports to the listener that was there at the tap',
+      (tester) async {
+    // The sheet outlives the tap by as long as the customer takes. A rebuild
+    // while it is open must not hand the outcome to a listener that never saw
+    // this payment start.
+    final gate = Completer<bool>();
+    final atTap = <dynamic>[];
+    final later = <dynamic>[];
+
+    Widget subject(Function onPaymentResult) => buildSubject(
+          config: buildConfig(orderNumber: 'order-A'),
+          onPaymentResult: onPaymentResult,
+          onBeforePayment: () => gate.future,
+        );
+
+    await asAndroid(() async {
+      await pumpReady(tester, subject(atTap.add));
+
+      await tester.tap(find.byType(ElevatedButton));
+      await tester.pump();
+
+      await tester.pumpWidget(subject(later.add));
+      await tester.pumpAndSettle();
+
+      gate.complete(true);
+      await tester.pumpAndSettle();
+
+      expect(sheetCalls(), hasLength(1));
+
+      await reportSheetFailed('${SpaySdk.ERROR_USER_CANCELED}');
+      await tester.pumpAndSettle();
+    });
+
+    expect(atTap.single, isA<PaymentCanceledError>());
+    expect(later, isEmpty);
+  });
+
+  testWidgets('charges back to the listener that was there at the tap',
+      (tester) async {
+    // Same rule on the paying path: the charge that the tap set off answers to
+    // the listener the tap was made under, not to whoever replaced it.
+    final gate = Completer<bool>();
+    final atTap = <dynamic>[];
+    final later = <dynamic>[];
+
+    Widget subject(Function onPaymentResult) => buildSubject(
+          config: buildConfig(orderNumber: 'order-A'),
+          onPaymentResult: onPaymentResult,
+          onBeforePayment: () => gate.future,
+        );
+
+    final client = MockClient((request) async =>
+        http.Response(jsonEncode({'type': 'network_error'}), 400));
+
+    await http.runWithClient(() async {
+      await asAndroid(() async {
+        await pumpReady(tester, subject(atTap.add));
+
+        await tester.tap(find.byType(ElevatedButton));
+        await tester.pump();
+
+        await tester.pumpWidget(subject(later.add));
+        await tester.pumpAndSettle();
+
+        gate.complete(true);
+        await tester.pumpAndSettle();
+
+        await reportSheetSucceeded('tok_samsung');
+        await tester.pumpAndSettle();
+      });
+    }, () => client);
+
+    expect(atTap.single, isA<NetworkError>());
+    expect(later, isEmpty);
   });
 }
